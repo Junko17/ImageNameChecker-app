@@ -1,8 +1,12 @@
 import os
 import re
 import shutil
+import zipfile
 import openpyxl
 from openpyxl.styles import PatternFill
+import streamlit as st
+import pandas as pd
+from io import BytesIO
 
 # 加载规则文件
 def load_rules(file_path):
@@ -17,68 +21,11 @@ def load_rules(file_path):
             raise ValueError(f"规则文件缺少必须条目：{', '.join(missing)}")
         return raw_rules
     except Exception as e:
-        print(f"规则加载失败：{str(e)}")
-        exit(1)
-
-# 移动SKU文件夹并清理空目录
-def move_and_cleanup_sku_folders(base_folder):
-    """移动 SKU 文件夹，并清理空文件夹"""
-    if not os.path.exists(base_folder):
-        print(f"目标文件夹 '{base_folder}' 不存在！")
-        return
-
-    for root, dirs, files in os.walk(base_folder, topdown=False):
-        for file in files:
-            if file.endswith(".jpg"):
-                file_path = os.path.join(root, file)
-                sku_folder = os.path.basename(os.path.dirname(file_path))
-                dest_folder = os.path.join(base_folder, sku_folder)
-                dest_path = os.path.join(dest_folder, file)
-
-                if not os.path.exists(dest_folder):
-                    os.makedirs(dest_folder)
-
-                try:
-                    shutil.move(file_path, dest_path)
-                    print(f"文件移动成功：'{file_path}' -> '{dest_path}'")
-                except Exception as e:
-                    print(f"文件移动失败：'{file_path}'，错误：{e}")
-
-        if not os.listdir(root):  # 如果当前目录为空，删除它
-            try:
-                os.rmdir(root)
-                print(f"删除空文件夹：'{root}'")
-            except Exception as e:
-                print(f"删除失败：'{root}'，错误：{e}")
-
-# 修改文件夹名称
-def rename_subfolders(folder_path):
-    """按规则修正SKU文件夹命名"""
-    if not os.path.exists(folder_path):
-        print(f"目标文件夹 '{folder_path}' 不存在！")
-        return
-
-    for subfolder_name in os.listdir(folder_path):
-        subfolder_path = os.path.join(folder_path, subfolder_name)
-        if not os.path.isdir(subfolder_path):
-            continue
-
-        name_length = len(subfolder_name)
-        if name_length == 19 or name_length == 22:
-            new_name = subfolder_name[:-2]
-            new_path = os.path.join(folder_path, new_name)
-            try:
-                os.rename(subfolder_path, new_path)
-                print(f"重命名：'{subfolder_name}' -> '{new_name}'")
-            except Exception as e:
-                print(f"重命名失败：'{subfolder_name}' -> '{new_name}'，错误：{e}")
-        else:
-            print(f"跳过：'{subfolder_name}'，长度不符合要求")
+        st.error(f"规则加载失败：{str(e)}")
+        raise
 
 # 检查图片文件命名并生成报告
-def check_and_fix_folders(root_folder, rule_file):
-    rules = load_rules(rule_file)
-
+def check_and_fix_folders(root_folder, rules):
     wb = openpyxl.Workbook()
     sheet = wb.active
     sheet.title = "严格小写验证报告"
@@ -96,6 +43,8 @@ def check_and_fix_folders(root_folder, rule_file):
         r'\.jpg$'        # 扩展名（必须小写）
     )
 
+    report_data = []
+
     for folder in os.listdir(root_folder):
         folder_path = os.path.join(root_folder, folder)
         if not os.path.isdir(folder_path):
@@ -105,61 +54,94 @@ def check_and_fix_folders(root_folder, rule_file):
         all_files = os.listdir(folder_path)
         found_rules = set()
 
-        # 判断是否是有效的 SKU 文件夹
-        # 如果文件夹命名长度是 20 位或 17 位，则认为是正确的命名
+        # 判断是否为有效的 SKU 文件夹
         if len(folder) not in (20, 17):
-            errors.append(("-", "文件夹命名错误", "正确命名长度应为20位或17位"))
+            errors.append({"文件": "-", "错误": "文件夹命名错误", "正确示例": "长度应为20位或17位"})
 
-        # 文件检查
+        # 检查每个文件
         for file in all_files:
             if not file.endswith('.jpg'):
                 if file.lower().endswith('.jpg'):
-                    errors.append((file, "扩展名大小写错误", "必须使用小写.jpg"))
+                    errors.append({"文件": file, "错误": "扩展名大小写错误", "正确示例": "必须使用小写 .jpg"})
                 continue
 
             if file != file.lower():
-                errors.append((file, "文件名大小写错误", "所有字母必须小写，如：pipe-shelves-m100-1.2w.jpg"))
+                errors.append({"文件": file, "错误": "文件名大小写错误", "正确示例": "所有字母必须小写"})
                 continue
 
             match = file_pattern.match(file)
             if not match:
-                errors.append((file, "命名结构错误", "示例：pipe-shelves-m100-1.2w.jpg"))
+                errors.append({"文件": file, "错误": "命名结构错误", "正确示例": "示例：pipe-shelves-m100-1.2w.jpg"})
                 continue
 
             rule_segment = match.group(1)
             if rule_segment not in rules:
-                errors.append((file, "未授权规则段", f"允许的规则如：m100-1.2w"))
+                errors.append({"文件": file, "错误": "未授权规则段", "正确示例": "允许的规则如：m100-1.2w"})
             else:
                 found_rules.add(rule_segment)
 
+        # 必须包含的规则段检查
         mandatory_check = {'m100-1.2w', 'f1w', 'f2w', 'f3w', 'f4w', 'f5w', 'f6w', 'm100-8w', 'm100-9w'}
         missing = mandatory_check - found_rules
         if missing:
-            errors.append((
-                ", ".join(missing),
-                "缺少核心文件",
-                "必须存在的规则段（可带小写关键词段）"
-            ))
+            errors.append({"文件": ", ".join(missing), "错误": "缺少核心文件", "正确示例": "必须存在这些规则段"})
 
         if errors:
             errors_found = True
             for error in errors:
-                sheet.append([folder, error[0], error[1], error[2]])
+                sheet.append([folder, error["文件"], error["错误"], error["正确示例"]])
             os.rename(folder_path, os.path.join(root_folder, f"INVALID_{folder}"))
 
     if errors_found:
-        report_path = os.path.join(root_folder, "图片命名规则验证报告.xlsx")
-        wb.save(report_path)
-        print(f"发现异常，报告已生成：{report_path}")
+        output = BytesIO()
+        wb.save(output)
+        return output
     else:
-        print("未发现异常")
+        return None
 
-# 主程序
-if __name__ == "__main__":
-    desktop_path = os.path.expanduser("~/Desktop")
-    img_folder = os.path.join(desktop_path, "ImgNameCheck")
-    rule_file_path = os.path.join(desktop_path, "withoutLogo_ImgName_rules.txt")
+# Streamlit 部分
+st.title("图片命名规则检查工具")
+st.write(
+    "本工具支持上传一个包含图片文件夹的 `.zip` 文件，解压后检查图片命名规则并生成检查报告。"
+)
 
-    move_and_cleanup_sku_folders(img_folder)
-    rename_subfolders(img_folder)
-    check_and_fix_folders(img_folder, rule_file_path)
+# 上传规则文件
+rules_file = st.file_uploader("上传规则文件 (TXT 格式)", type=["txt"])
+if rules_file:
+    rule_text = rules_file.read().decode("utf-8")
+    rules = {line.strip().lower() for line in rule_text.splitlines() if line.strip()}
+
+# 上传 .zip 文件夹
+uploaded_file = st.file_uploader("请上传包含图片的 .zip 文件", type=["zip"])
+
+if uploaded_file and rules_file:
+    # 创建临时处理目录
+    temp_dir = "temp_uploaded"
+    os.makedirs(temp_dir, exist_ok=True)
+
+    # 保存上传的 .zip 文件
+    zip_path = os.path.join(temp_dir, "uploaded.zip")
+    with open(zip_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    # 解压 .zip 文件
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(temp_dir)
+    
+    st.success("文件解压完成！检查开始...")
+    
+    # 执行检查并生成报告
+    report = check_and_fix_folders(temp_dir, rules)
+    if report:
+        st.success("检查完成！发现问题，生成了报告。")
+        st.download_button(
+            label="下载检查报告",
+            data=report.getvalue(),
+            file_name="检查报告.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.success("检查完成！未发现问题。")
+
+    # 清理临时目录
+    shutil.rmtree(temp_dir)
